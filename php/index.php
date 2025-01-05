@@ -128,34 +128,45 @@ $container->set('helper', function ($c) {
         public function make_posts(array $results, $options = []) {
             $options += ['all_comments' => false];
             $all_comments = $options['all_comments'];
-
+        
+            $post_ids = array_column($results, 'id');
+            if (empty($post_ids)) {
+                return [];
+            }
+        
+            // コメント数を一括で取得
+            $placeholders = implode(',', array_fill(0, count($post_ids), '?'));
+            $comment_counts_query = $this->db()->prepare("SELECT post_id, COUNT(*) AS count FROM comments WHERE post_id IN ($placeholders) GROUP BY post_id");
+            $comment_counts_query->execute($post_ids);
+            $comment_count_map = [];
+            foreach ($comment_counts_query->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $comment_count_map[$row['post_id']] = $row['count'];
+            }
+        
+            // コメントを一括で取得
+            $comments_query = $this->db()->prepare("SELECT * FROM comments WHERE post_id IN ($placeholders) ORDER BY created_at DESC");
+            $comments_query->execute($post_ids);
+            $all_comments_data = $comments_query->fetchAll(PDO::FETCH_ASSOC);
+        
+            // コメントを投稿ごとに整理
+            $comments_map = [];
+            foreach ($all_comments_data as $comment) {
+                $comments_map[$comment['post_id']][] = $comment;
+            }
+        
+            // 投稿データを構築
             $posts = [];
             foreach ($results as $post) {
-                $post['comment_count'] = $this->fetch_first('SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?', $post['id'])['count'];
-                $query = 'SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC';
-                if (!$all_comments) {
-                    $query .= ' LIMIT 3';
-                }
-
-                $ps = $this->db()->prepare($query);
-                $ps->execute([$post['id']]);
-                $comments = $ps->fetchAll(PDO::FETCH_ASSOC);
-                foreach ($comments as &$comment) {
-                    $comment['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $comment['user_id']);
-                }
-                unset($comment);
-                $post['comments'] = array_reverse($comments);
-
-                $post['user'] = $this->fetch_first('SELECT * FROM `users` WHERE `id` = ?', $post['user_id']);
+                $post['comment_count'] = $comment_count_map[$post['id']] ?? 0;
+                $post['comments'] = array_slice($comments_map[$post['id']] ?? [], 0, $all_comments ? null : 3);
+                $post['user'] = $this->fetch_first('SELECT * FROM users WHERE id = ?', $post['user_id']);
                 if ($post['user']['del_flg'] == 0) {
                     $posts[] = $post;
                 }
-                if (count($posts) >= POSTS_PER_PAGE) {
-                    break;
-                }
             }
+        
             return $posts;
-        }
+        }        
 
     };
 });
@@ -297,8 +308,16 @@ $app->get('/', function (Request $request, Response $response) {
     $me = $this->get('helper')->get_session_user();
 
     $db = $this->get('db');
-    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC');
-    $ps->execute();
+
+    // ページングの設定
+    $page = $request->getQueryParams()['page'] ?? 1;
+    $offset = ($page - 1) * POSTS_PER_PAGE;
+
+    // 必要な投稿データだけを取得
+    $ps = $db->prepare('SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC LIMIT :limit OFFSET :offset');
+    $ps->bindValue(':limit', (int)POSTS_PER_PAGE, PDO::PARAM_INT);
+    $ps->bindValue(':offset', (int)$offset, PDO::PARAM_INT);
+    $ps->execute();    
     $results = $ps->fetchAll(PDO::FETCH_ASSOC);
     $posts = $this->get('helper')->make_posts($results);
 
